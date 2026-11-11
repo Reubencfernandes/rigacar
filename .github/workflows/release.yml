@@ -1,10 +1,13 @@
-name: Release 🚢
+name: Release
 
 on:
   push:
     tags:
       - 'v*'
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   release:
@@ -13,7 +16,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Package plugin
+      # One zip for every Blender: a rigacar/ folder with blender_manifest.toml installs as an extension on
+      # Blender 4.2 and later, and with bl_info as a legacy add-on before. .gitattributes leaves tests and docs out.
+      - name: Package the add-on
         run: git archive --prefix=rigacar/ --format=zip HEAD -o rigacar-${{ github.ref_name }}.zip
 
       - name: Attach to release

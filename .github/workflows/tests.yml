@@ -1,0 +1,50 @@
+name: Tests
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  physics:
+    name: Physics models
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Unit tests
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  blender:
+    name: Blender ${{ matrix.blender }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        blender: ['5.2.2', '4.5.16']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Blender
+        run: |
+          version=${{ matrix.blender }}
+          series=${version%.*}
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb libxi6 libxkbcommon0 libxkbcommon-x11-0 libsm6 libgl1 libegl1 \
+            libxrender1 libxxf86vm1 libxfixes3 libxinerama1 libxcursor1 libxrandr2 libwayland-client0 > /dev/null
+          curl -fsSL "https://download.blender.org/release/Blender${series}/blender-${version}-linux-x64.tar.xz" \
+            | tar -xJ -C "$RUNNER_TEMP"
+          echo "BLENDER=$RUNNER_TEMP/blender-${version}-linux-x64/blender" >> "$GITHUB_ENV"
+
+      - name: Validate the extension manifest
+        run: $BLENDER --factory-startup --command extension validate .
+
+      - name: Background test (scripts and render farms)
+        run: $BLENDER --background --factory-startup --python tests/background.py
+
+      - name: End-to-end test (with a window)
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" $BLENDER --factory-startup --python tests/e2e.py
