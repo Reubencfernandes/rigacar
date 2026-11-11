@@ -5,6 +5,8 @@ under a virtual display when headless, from the repository root:
     xvfb-run -a blender --factory-startup --python tests/e2e.py
 Exits non-zero when any check fails.
 """
+import json
+import math
 import os
 import sys
 import tempfile
@@ -28,9 +30,20 @@ def check(condition, message):
         failures.append(message)
 
 
+def link_directory(target, link):
+    """Symlinks a directory; falls back to a junction on Windows, which needs no developer mode."""
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except OSError:
+        if os.name != 'nt':
+            raise
+        import _winapi
+        _winapi.CreateJunction(target, link)
+
+
 def import_addon():
     link_dir = tempfile.mkdtemp(prefix='rigacar-e2e-')
-    os.symlink(REPO, os.path.join(link_dir, ADDON_NAME))
+    link_directory(REPO, os.path.join(link_dir, ADDON_NAME))
     sys.path.insert(0, link_dir)
     import rigacar
     rigacar.register()
@@ -551,6 +564,371 @@ def test_scaled_parented_model_rigs_like_plain():
     check(max_bounds_delta(reference_objects, objects_before) < 1e-4, 'both models share the same world geometry')
 
 
+FORWARD = mathutils.Vector((0, -1, 0))
+LEFT = mathutils.Vector((1, 0, 0))
+
+
+def world_direction(obj, local):
+    return (obj.matrix_world.to_3x3() @ local).normalized()
+
+
+def refresh(rig):
+    rig.update_tag()
+    bpy.context.view_layer.update()
+
+
+def drive_along_circle(rig, frames=48, radius=8.0):
+    """Root follows a quarter of a circle through the origin over the frames."""
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.curve.primitive_bezier_circle_add(radius=radius, location=(radius, 0, 0))
+    path = bpy.context.object
+    path.select_set(False)
+    rig.select_set(True)
+    bpy.context.view_layer.objects.active = rig
+    cns = rig.pose.bones['Root'].constraints.new('FOLLOW_PATH')
+    cns.target = path
+    cns.use_curve_follow = True
+    cns.use_fixed_location = True
+    cns.forward_axis = 'TRACK_NEGATIVE_Y'
+    data_path = 'pose.bones["Root"].constraints["%s"].offset_factor' % cns.name
+    for frame, factor in ((1, 0.0), (frames, 0.25)):
+        cns.offset_factor = factor
+        rig.keyframe_insert(data_path, frame=frame)
+    for fcurve in bake_fcurves(rig):
+        for point in fcurve.keyframe_points:
+            point.interpolation = 'LINEAR'
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, frames
+    return path
+
+
+def bake_fcurves(rig):
+    animation_data = rig.animation_data
+    if not animation_data or not animation_data.action:
+        return []
+    fcurves = sys.modules[ADDON_NAME].bake_operators.action_fcurves(animation_data.action,
+                                                                     getattr(animation_data, 'action_slot', None))
+    return list(fcurves) if fcurves is not None else []
+
+
+def root_positions(rig, frames):
+    positions = []
+    for frame in frames:
+        bpy.context.scene.frame_set(frame)
+        positions.append((rig.matrix_world @ rig.pose.bones['Root'].head).copy())
+    return positions
+
+
+def turns_left(rig, frames):
+    a, b, c = root_positions(rig, frames)
+    return (b - a).cross(c - b).z > 0
+
+
+def body_yaw_from_root(rig, body, frame):
+    """Signed yaw of the body away from the Root's heading, counter-clockwise seen from above: the drift.
+
+    The Root, not its velocity, is the reference: Follow Path adds the curve to the armature object's own
+    location, so a rig whose origin is off the path runs a parallel curve and crabs slightly in bends.
+    """
+    bpy.context.scene.frame_set(frame)
+    path_heading = rig.matrix_world.to_3x3() @ rig.pose.bones['Root'].matrix.to_3x3() @ FORWARD
+    heading = world_direction(body, FORWARD)
+    path_heading.z = heading.z = 0
+    return math.atan2(path_heading.cross(heading).z, path_heading.dot(heading))
+
+
+def physics_bake(**options):
+    settings = dict(frame_start=1, frame_end=48)
+    settings.update(options)
+    return bpy.ops.anim.car_physics_bake('EXEC_DEFAULT', **settings)
+
+
+def test_physics_channels_drive_the_body():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    for name in ('Body.pitch', 'Body.roll', 'Body.heave', 'Wheel.bump.Ft.L', 'Wheel.bump.Bk.R'):
+        check(name in rig.keys(), f'generated rig has the physics channel {name}')
+
+    nose = world_direction(body, FORWARD).z
+    rig['Body.pitch'] = .1
+    refresh(rig)
+    check(world_direction(body, FORWARD).z - nose > .09, f'Body.pitch raises the nose: {world_direction(body, FORWARD).z:.3f}')
+    rig['Body.pitch'] = .0
+
+    rig['Body.roll'] = .1
+    refresh(rig)
+    left = world_direction(body, LEFT).z
+    check(left > .09, f'Body.roll leans the body to its right, lifting its left: {left:.3f}')
+    rig['Body.roll'] = .0
+
+    height = body.matrix_world.translation.z
+    rig['Body.heave'] = .1
+    refresh(rig)
+    check(abs(body.matrix_world.translation.z - height - .1) < 1e-3, 'Body.heave lifts the body')
+    rig['Body.heave'] = .0
+
+    wheel_heights = [w.matrix_world.translation.z for w in wheels]
+    brake_height = brake.matrix_world.translation.z
+    rig['Wheel.bump.Ft.L'] = .05
+    refresh(rig)
+    lifted = [w.matrix_world.translation.z - h for w, h in zip(wheels, wheel_heights)]
+    check(abs(lifted[0] - .05) < 1e-3 and all(abs(d) < 1e-6 for d in lifted[1:]),
+          f'Wheel.bump lifts only its wheel: {[round(d, 3) for d in lifted]}')
+    check(abs(brake.matrix_world.translation.z - brake_height - .05) < 1e-3, 'the brake rides with its wheel')
+    rig['Wheel.bump.Ft.L'] = .0
+    refresh(rig)
+
+
+def test_set_ground_follows_terrain():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    bpy.ops.mesh.primitive_plane_add(size=40, location=(0, 0, .1))
+    ground = bpy.context.object
+    bpy.context.view_layer.objects.active = rig
+    rig.select_set(True)
+    resting = body.matrix_world.translation.z
+
+    result = bpy.ops.object.car_rig_set_ground('EXEC_DEFAULT', ground=ground.name, travel=.3)
+    check(result == {'FINISHED'}, f'set ground: {result}')
+    sensors = list(sys.modules[ADDON_NAME].car_rig.enumerate_ground_sensors(rig.pose.bones))
+    projections = [s.constraints['Ground projection'] for s in sensors]
+    check(len(sensors) == 6 and all(c.target == ground and c.shrinkwrap_type == 'PROJECT' for c in projections),
+          f'every sensor raycasts onto the ground: {len(sensors)}')
+    limits = [s.constraints['Ground projection limitation'] for s in sensors if 'Ground projection limitation' in s.constraints]
+    check(limits and all(abs(c.max_z - .3) < 1e-6 and abs(c.min_z + .3) < 1e-6 for c in limits), 'travel sets the limits')
+    refresh(rig)
+    check(abs(body.matrix_world.translation.z - resting - .1) < 2e-3,
+          f'the car rides on the raised ground: {body.matrix_world.translation.z - resting:.3f}')
+
+    # A ramp rising towards the front tilts the car nose up.
+    ground.location.z = 0
+    ground.rotation_euler.x = math.radians(-6)
+    refresh(rig)
+    nose = world_direction(body, FORWARD).z
+    check(nose > .03, f'the car follows a slope: nose {nose:.3f}')
+
+    result = bpy.ops.object.car_rig_set_ground('EXEC_DEFAULT', ground='')
+    check(result == {'FINISHED'} and all(c.target is None for c in projections), 'clearing the ground')
+    refresh(rig)
+    check(abs(body.matrix_world.translation.z - resting) < 2e-3, 'without ground the car is back on the floor')
+
+    try:
+        bpy.ops.object.car_rig_set_ground('EXEC_DEFAULT', ground=body.name)
+        check(False, 'the car may not drive on itself')
+    except RuntimeError as error:
+        check('itself' in str(error), f'the car may not drive on itself: {str(error).splitlines()[0]}')
+
+
+def test_physics_bake_drifts_on_loose_ground():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    drive_along_circle(rig)
+    left = turns_left(rig, (10, 20, 30))
+
+    result = physics_bake(surface='ASPHALT')
+    check(result == {'FINISHED'}, f'physics baked on asphalt: {result}')
+    yaw = max(abs(body_yaw_from_root(rig, body, f)) for f in range(6, 44, 4))
+    check(yaw < math.radians(1), f'asphalt holds a 0.5 g corner without drifting: {math.degrees(yaw):.1f}Â°')
+    bpy.context.scene.frame_set(30)
+    asphalt_roll = rig.get('Body.roll', 0)
+    check((asphalt_roll > 0) == left and abs(asphalt_roll) > math.radians(.5),
+          f'the body leans out of the corner: {math.degrees(asphalt_roll):.2f}Â°')
+
+    result = physics_bake(surface='MUD')
+    check(result == {'FINISHED'}, f'physics baked on mud: {result}')
+    yaws = [body_yaw_from_root(rig, body, f) for f in range(30, 46, 2)]
+    worst = max(yaws, key=abs)
+    check(abs(worst) > math.radians(8), f'mud lets the rear slide out: {math.degrees(worst):.1f}Â°')
+    check((worst > 0) == left, f'the car yaws into the turn, the rear swinging out: left turn {left}, '
+                              f'yaw {math.degrees(worst):.1f}Â°')
+
+    bpy.context.scene.frame_set(44)
+    steering = rig.get('Steering.rotation', 0)
+    check(abs(steering) > .01, f'steering baked with the physics: {steering:.3f}')
+    rear, front = abs(rig.get('Wheel.rotation.Bk.L', 0)), abs(rig.get('Wheel.rotation.Ft.L', 0))
+    check(rear > front * 1.05, f'the driven rear wheels spin while sliding: rear {rear:.1f}, front {front:.1f}')
+
+    drift_curve = next((fc for fc in bake_fcurves(rig) if fc.data_path == 'pose.bones["Drift"].rotation_euler'), None)
+    check(drift_curve is not None and all(p.type == 'JITTER' for p in drift_curve.keyframe_points),
+          'drift is keyed on the Drift control as baked keys')
+
+    result = physics_bake(surface='ICE')
+    yaws_ice = [body_yaw_from_root(rig, body, f) for f in range(30, 46, 2)]
+    check(max(map(abs, yaws_ice)) > abs(worst), f'ice drifts more than mud: {math.degrees(max(map(abs, yaws_ice))):.1f}Â°')
+
+
+def keyed_straight_run(rig, distance=20.0, frames=48):
+    """Root starts and stops: Bezier keys accelerate over the first half and brake over the second."""
+    root = rig.pose.bones['Root']
+    root.location = (0, 0, 0)
+    root.keyframe_insert('location', frame=1)
+    root.location = (0, -distance, 0)
+    root.keyframe_insert('location', frame=frames)
+    scene = bpy.context.scene
+    scene.frame_start, scene.frame_end = 1, frames
+
+
+def test_physics_bake_pitches_and_slips():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    keyed_straight_run(rig)
+    scene = bpy.context.scene
+
+    result = physics_bake(surface='ASPHALT', bake_drift=False)
+    check(result == {'FINISHED'}, f'physics baked on a straight run: {result}')
+    pitches = {f: (scene.frame_set(f), rig.get('Body.pitch', 0))[1] for f in range(1, 49)}
+    accelerating, braking = max(pitches[f] for f in range(4, 20)), min(pitches[f] for f in range(30, 46))
+    check(accelerating > math.radians(.5), f'the nose rises when accelerating: {math.degrees(accelerating):.2f}Â°')
+    check(braking < -math.radians(.5), f'the nose dives when braking: {math.degrees(braking):.2f}Â°')
+    scene.frame_set(48)
+    asphalt_rotation = abs(rig.get('Wheel.rotation.Bk.L', 0))
+    expected = 20 / .35
+    check(abs(asphalt_rotation - expected) / expected < .03,
+          f'on asphalt the wheels roll without slip: {asphalt_rotation:.1f} rad of {expected:.1f}')
+    check(rig.get('Body.heave', 0) == 0 or abs(rig.get('Body.heave', 0)) < 1e-3, 'smooth asphalt keeps the ride height')
+
+    physics_bake(surface='MUD', bake_drift=False, drive='RWD')
+    scene.frame_set(16)
+    rear, front = abs(rig.get('Wheel.rotation.Bk.L', 0)), abs(rig.get('Wheel.rotation.Ft.L', 0))
+    check(rear > front * 1.1, f'mud: the rear-driven wheels spin on the launch: rear {rear:.1f}, front {front:.1f}')
+    physics_bake(surface='MUD', bake_drift=False, drive='FWD')
+    scene.frame_set(16)
+    rear, front = abs(rig.get('Wheel.rotation.Bk.L', 0)), abs(rig.get('Wheel.rotation.Ft.L', 0))
+    check(front > rear * 1.1, f'mud: front-wheel drive spins the front instead: front {front:.1f}, rear {rear:.1f}')
+
+    physics_bake(surface='ICE', bake_drift=False)
+    scene.frame_set(48)
+    ice_front = abs(rig.get('Wheel.rotation.Ft.L', 0))
+    check(ice_front < asphalt_rotation * .9, f'ice: the wheels lock when braking: {ice_front:.1f} rad')
+
+
+def test_physics_bake_rough_mud_shakes_and_sinks():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    keyed_straight_run(rig)
+    scene = bpy.context.scene
+    physics_bake(surface='MUD', bake_drift=False)
+    bumps = [(scene.frame_set(f), rig.get('Wheel.bump.Ft.L', 0))[1] for f in range(1, 49)]
+    heave = [(scene.frame_set(f), rig.get('Body.heave', 0))[1] for f in range(1, 49)]
+    spread = max(bumps) - min(bumps)
+    check(spread > .01, f'rough mud shakes the wheels: {spread:.3f} spread')
+    check(-.1 < sum(bumps) / len(bumps) < -.03,
+          f'the tyres sink into the mud: mean {sum(bumps) / len(bumps):.3f}')
+    check(sum(heave) / len(heave) < -.03, f'the body sinks with them: mean {sum(heave) / len(heave):.3f}')
+    heave_spread = max(heave) - min(heave)
+    check(heave_spread < spread, f'the springs soften the shaking for the body: {heave_spread:.3f} < {spread:.3f}')
+
+    # The ground is fixed in the world: a car standing still does not shake.
+    front_still = [(scene.frame_set(f), rig.get('Wheel.bump.Ft.L', 0))[1] for f in (1, 2)]
+    check(abs(front_still[0] - front_still[1]) < 5e-3, 'a car at rest barely moves on rough ground')
+
+
+def test_clear_keeps_hand_made_drift():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    drive_along_circle(rig)
+    drift = rig.pose.bones['Drift']
+    drift.rotation_euler.z = .3
+    drift.keyframe_insert('rotation_euler', index=2, frame=80)
+    physics_bake(surface='MUD')
+    result = bpy.ops.anim.car_clear_steering_wheels_rotation('EXEC_DEFAULT')
+    check(result == {'FINISHED'}, f'cleared: {result}')
+    curve = next((fc for fc in bake_fcurves(rig) if fc.data_path == 'pose.bones["Drift"].rotation_euler'), None)
+    frames = [p.co[0] for p in curve.keyframe_points] if curve else []
+    check(frames == [80.0], f'clearing keeps the hand-made drift key only: {frames}')
+    physics_paths = [fc.data_path for fc in bake_fcurves(rig)
+                     if fc.data_path.startswith('["Body.') or fc.data_path.startswith('["Wheel.bump')]
+    check(not physics_paths, f'clearing removes suspension and bumps: {physics_paths}')
+
+
+def test_old_rig_gains_physics_channels():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    # A rig from Rigacar 8 or older has no physics channels.
+    for fcurve in list(rig.animation_data.drivers):
+        if fcurve.data_path.startswith('pose.bones["MCH-Body"]') or \
+                (fcurve.data_path.startswith('pose.bones["MCH-Wheel') and fcurve.data_path.endswith('location')):
+            rig.animation_data.drivers.remove(fcurve)
+    for name in [k for k in rig.keys() if k.startswith('Body.') or k.startswith('Wheel.bump')]:
+        del rig[name]
+    keyed_straight_run(rig)
+    result = physics_bake(surface='DIRT', bake_drift=False)
+    check(result == {'FINISHED'}, f'an old rig bakes physics: {result}')
+    check(all(name in rig.keys() for name in ('Body.pitch', 'Body.roll', 'Body.heave', 'Wheel.bump.Bk.R')),
+          'and gains the physics channels')
+    drivers = [d.data_path for d in rig.animation_data.drivers if d.data_path.startswith('pose.bones["MCH-Body"]')]
+    check(len(drivers) == 3, f'with drivers on the body: {drivers}')
+
+
+def test_follow_path_keeps_the_car_on_the_curve():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    rig = rig_car(body, wheels, brake)
+    bpy.ops.object.mode_set(mode='OBJECT')
+    centre = mathutils.Vector((20, 5, 0))
+    bpy.ops.curve.primitive_bezier_circle_add(radius=8, location=centre)
+    path = bpy.context.object
+    # Curves made by scripts or converted from meshes come without path animation: the helper turns it on.
+    path.data.use_path = False
+    bpy.context.view_layer.objects.active = rig
+    result = bpy.ops.object.car_rig_follow_path('EXEC_DEFAULT', curve=path.name, frame_start=1, frame_end=96,
+                                                easing='LINEAR')
+    check(result == {'FINISHED'}, f'follow path helper: {result}')
+    distances = [(p - centre).length for p in root_positions(rig, (1, 24, 48, 72))]
+    check(all(abs(d - 8) < .05 for d in distances),
+          f'the Root rides on the curve itself: {[round(d, 3) for d in distances]}')
+    crab = 0.0
+    for frame in (20, 40, 60):
+        before, after = root_positions(rig, (frame - 1, frame + 1))
+        velocity = after - before
+        bpy.context.scene.frame_set(frame)
+        heading = rig.matrix_world.to_3x3() @ rig.pose.bones['Root'].matrix.to_3x3() @ FORWARD
+        crab = max(crab, abs(math.atan2(velocity.cross(heading).z, velocity.dot(heading))))
+    check(crab < math.radians(1), f'the car faces where it goes, without crabbing: {math.degrees(crab):.2f}°')
+
+    result = bpy.ops.anim.car_wheels_rotation_bake('EXEC_DEFAULT', frame_start=1, frame_end=96)
+    bpy.context.scene.frame_set(96)
+    # The rear axle runs the curve; its wheels run circles half a track wider and narrower.
+    expected = 2 * math.pi * 8 / .35
+    left, right = abs(rig.get('Wheel.rotation.Bk.L', 0)), abs(rig.get('Wheel.rotation.Bk.R', 0))
+    check(abs((left + right) / 2 - expected) / expected < .03,
+          f'the rear wheels roll the lap: {(left + right) / 2:.1f} of {expected:.1f} rad')
+    outer, inner = max(left, right), min(left, right)
+    check(abs(outer / inner - 8.85 / 7.15) < .03, f'the outer wheel turns more than the inner: {outer / inner:.3f}')
+
+    # A scaled curve only warns: the car still follows it.
+    path.scale = (2, 2, 2)
+    bpy.context.view_layer.objects.active = rig
+    result = bpy.ops.object.car_rig_follow_path('EXEC_DEFAULT', curve=path.name, frame_start=1, frame_end=96)
+    check(result == {'FINISHED'}, f'a scaled curve is followed with a warning: {result}')
+    check(len([c for c in rig.pose.bones['Root'].constraints if c.type == 'FOLLOW_PATH']) == 1,
+          'following again replaces the constraint')
+
+
+def test_redo_keeps_the_rigged_parts():
+    reset_scene()
+    body, _, wheels, brake = build_car()
+    # Adjust Last Operation undoes and runs execute again with the properties invoke filled in,
+    # target_objects among them, while the parts are no longer selected.
+    targets = json.dumps({'Body': body.name, 'Wheel.Ft.L': wheels[0].name, 'Wheel.Ft.R': wheels[1].name,
+                          'Wheel.Bk.L': wheels[2].name, 'Wheel.Bk.R': wheels[3].name, 'WheelBrake.Ft.L': brake.name})
+    bpy.ops.object.select_all(action='DESELECT')
+    result = bpy.ops.object.armature_car_deformation_rig('EXEC_DEFAULT', target_objects=targets,
+                                                         nb_front_wheel_brakes_pairs=1)
+    rig = bpy.context.object
+    check(result == {'FINISHED'} and body.parent == rig and all(w.parent == rig for w in wheels),
+          'running it again from its properties rigs the same parts')
+    check(abs(rig.data.bones['DEF-Wheel.Ft.L'].head_local.y - (-1.4)) < 1e-3, 'at their own places')
+
+
 def main():
     print(f'[e2e] Blender {bpy.app.version_string}', flush=True)
     rigacar = import_addon()
@@ -559,7 +937,11 @@ def main():
                  test_full_pipeline, test_rig_drives_model, test_bake_along_follow_path_keeps_keyframes,
                  test_bake_explains_an_animated_armature_object, test_default_bake_frame_range,
                  test_bake_along_an_animated_path, test_real_model_rigs_and_rolls, test_polls_without_a_rig,
-                 test_scaled_parented_model_rigs_like_plain):
+                 test_scaled_parented_model_rigs_like_plain, test_physics_channels_drive_the_body,
+                 test_set_ground_follows_terrain, test_physics_bake_drifts_on_loose_ground,
+                 test_physics_bake_pitches_and_slips, test_physics_bake_rough_mud_shakes_and_sinks,
+                 test_clear_keeps_hand_made_drift, test_old_rig_gains_physics_channels,
+                 test_redo_keeps_the_rigged_parts, test_follow_path_keeps_the_car_on_the_curve):
         try:
             with viewport():
                 test()
