@@ -90,3 +90,6 @@ ENV/
 
 # Git archive
 *.zip
+
+# Built extension packages
+dist/
