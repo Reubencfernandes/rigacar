@@ -1,0 +1,38 @@
+schema_version = "1.0.0"
+
+# Rigacar as a Blender extension (Blender 4.2 and later). Older Blenders read bl_info in __init__.py.
+id = "rigacar"
+version = "9.0.0"
+name = "Rigacar"
+tagline = "Car rigs with baked wheels, steering, drift and suspension"
+maintainer = "Reuben Fernandes"
+type = "add-on"
+
+website = "https://github.com/Reubencfernandes/rigacar"
+
+tags = ["Rigging", "Animation"]
+
+blender_version_min = "4.2.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+copyright = [
+  "2017-2024 David Gayerie",
+  "2024-2026 Webber Takken and contributors",
+  "2026 Reuben Fernandes",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/.github/",
+  "/.idea/",
+  "/docs/",
+  "/tests/",
+  "/dist/",
+  "*.zip",
+  ".gitattributes",
+  ".gitignore",
+]
