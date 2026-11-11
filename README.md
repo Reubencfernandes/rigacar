@@ -11,8 +11,7 @@ counter-steer, the spinning rear wheels, the body rolling and pitching on its sp
 | Blender | Status |
 |---|---|
 | **5.2 LTS** | ✅ Supported. Every feature tested: 134 end-to-end checks, a background suite and 23 unit tests |
-| 4.5 LTS | ✅ Supported. Tested in CI |
-| 4.2 – 5.1 | Should work. Installs as an extension; rigging and baking tested by the [webbertakken fork](https://github.com/webbertakken/rigacar) |
+| 4.2 – 5.1, including 4.5 LTS | Should work. Installs as an extension; rigging and baking were tested by the [webbertakken fork](https://github.com/webbertakken/rigacar), the physics only on 5.2 so far |
 | 4.0 – 4.1 | Should work, installed as a legacy add-on; untested by this fork |
 | 3.x and older | Use [upstream Rigacar 7.1](https://github.com/digicreatures/rigacar) |
 
@@ -374,7 +373,7 @@ blender --background --factory-startup --python tests/background.py
 On Windows, Blender lives in `C:\Program Files\Blender Foundation\Blender 5.2\blender.exe`. The end-to-end test links the
 repository as an add-on through a symlink, or through a junction on Windows when symlinks aren't allowed. It builds cars, rigs
 them, drives them, bakes every kind of physics on several surfaces, and checks the results numerically: 134 checks on Blender 5.2.
-GitHub Actions runs all three suites on Blender 5.2 and 4.5 for every push.
+The Tests workflow (.github/workflows/tests.yml) runs all three suites on Blender 5.2 and 4.5 on GitHub Actions.
 
 To regenerate the documentation images and the animation (needs ffmpeg for the GIF):
 
@@ -421,7 +420,7 @@ Releases are built by GitHub Actions when a `v*` tag is pushed.
 - The steering bake takes optional smoothing against twitching on uneven curves.
 
 **Tests and tooling**
-- Unit tests of the dynamics, more end-to-end checks and a background-mode suite, run by GitHub Actions on Blender 5.2 and 4.5.
+- Unit tests of the dynamics, more end-to-end checks and a background-mode suite, with a GitHub Actions workflow for Blender 5.2 and 4.5.
 - `docs/capture.py` renders the documentation from the add-on itself.
 
 ### 8.x ([webbertakken fork](https://github.com/webbertakken/rigacar))
